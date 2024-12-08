@@ -3,9 +3,57 @@ pragma solidity ^0.8.28;
 
 // Import required OpenZeppelin contracts for security and standard implementations
 import "@openzeppelin/contracts/access/Ownable.sol"; // Provides basic access control
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol"; // Prevents reentrancy attacks
 
-contract HackathonPrizePool is Ownable, ReentrancyGuard {
+struct RequestDetail {
+    address recipient;
+    uint256 requestAmount;
+    address[] path;
+    bytes paymentReference;
+    uint256 feeAmount;
+    uint256 maxToSpend;
+    uint256 maxRateTimespan;
+}
+
+struct MetaDetail {
+    uint256 paymentNetworkId;
+    RequestDetail[] requestDetails;
+}
+
+interface IBatchConversionPayments {
+    function batchPayments(
+        MetaDetail[] calldata metaDetails,
+        address[][] calldata pathsToUSD,
+        address feeAddress
+    ) external payable;
+}
+
+contract HackathonPrizeManagement is Ownable {
+    address private originalSender;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
+
+    modifier nonReentrant() {
+        if (
+            msg.sender != address(0xe11BF2fDA23bF0A98365e1A4c04A87C9339e8687) &&
+            msg.sender != address(0x67818703c92580c0e106e401F253E8A410A66f8B)
+        ) {
+            require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+            _status = _ENTERED;
+        }
+        _;
+        if (
+            msg.sender != address(0xe11BF2fDA23bF0A98365e1A4c04A87C9339e8687) &&
+            msg.sender != address(0x67818703c92580c0e106e401F253E8A410A66f8B)
+        ) {
+            _status = _NOT_ENTERED;
+        }
+    }
+
+    constructor() Ownable(msg.sender) {
+        _status = _NOT_ENTERED;
+    }
+
     enum HackathonState {
         OPEN, // Initial state, participants can join
         ONGOING, // Hackathon is in progress
@@ -36,6 +84,12 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
     // Store all hackathons by their ID
     mapping(string => Hackathon) public hackathons;
 
+    // Address of the BatchConversionPayments contract
+    address public batchConversionPayments =
+        address(0x67818703c92580c0e106e401F253E8A410A66f8B);
+    address public ethFeeProxy =
+        address(0xe11BF2fDA23bF0A98365e1A4c04A87C9339e8687);
+
     // Events to log important actions
     event HackathonCreated(
         string indexed hackathonId,
@@ -63,25 +117,42 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
         HackathonState newState
     );
 
+    event BatchPaymentExecutionAttempt(
+        string indexed hackathonId,
+        address[] winners,
+        uint256[] amounts,
+        bytes[] paymentReferences,
+        address feeAddress
+    );
+
+    event BatchPaymentExecutionFailed(
+        string indexed hackathonId,
+        string errorMessage
+    );
+
+    receive() external payable nonReentrant {}
+
     // Function to create a new hackathon
     function createHackathon(
         bool _isCrowdfunded,
-        string calldata hackathonId
-    ) external payable {
+        string calldata hackathonId,
+        uint256 basePrize
+    ) external {
         // Get reference to new hackathon in storage
         Hackathon storage hackathon = hackathons[hackathonId];
+        require(bytes(hackathon.id).length == 0, "Hackathon ID already exists");
 
         // Initialize hackathon data
         hackathon.id = hackathonId;
         hackathon.creator = msg.sender;
         hackathon.isCrowdfunded = _isCrowdfunded;
-        hackathon.basePrize = msg.value;
+        hackathon.basePrize = basePrize;
         hackathon.state = HackathonState.OPEN;
 
         emit HackathonCreated(
             hackathonId,
             msg.sender,
-            msg.value,
+            basePrize,
             _isCrowdfunded
         );
     }
@@ -113,8 +184,8 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
     // Function for recording a contribution to a crowdfunded hackathon
     function recordContribution(
         string calldata _hackathonId,
-        uint256 _amount,
-        address _contributor
+        address _contributor,
+        uint256 contributedAmount
     ) external nonReentrant {
         Hackathon storage hackathon = hackathons[_hackathonId];
 
@@ -123,20 +194,23 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
             hackathon.state != HackathonState.COMPLETED,
             "Hackathon is completed"
         );
-        require(_amount > 0, "Contribution amount must be greater than zero");
+        require(
+            contributedAmount > 0,
+            "Contribution amount must be greater than zero"
+        );
 
         // Update contribution amount
-        hackathon.contributionsPerAddress[_contributor] += _amount;
-        hackathon.contributions += _amount;
+        hackathon.contributionsPerAddress[_contributor] += contributedAmount;
+        hackathon.contributions += contributedAmount;
 
-        emit ContributionAdded(_hackathonId, _contributor, _amount);
+        emit ContributionAdded(_hackathonId, _contributor, contributedAmount);
     }
 
     // Function for updating hackathon state - only contract owner can call
     function updateHackathonState(
         string calldata _hackathonId,
         HackathonState _newState
-    ) external onlyOwner {
+    ) external {
         Hackathon storage hackathon = hackathons[_hackathonId];
         require(
             uint8(_newState) > uint8(hackathon.state),
@@ -148,10 +222,10 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
     }
 
     // Function for announcing winning teams - only contract owner can call
-    function announceWinners(
+    function announceWinner(
         string calldata _hackathonId,
         address _winningParticipant
-    ) external onlyOwner {
+    ) external onlyOwner nonReentrant {
         Hackathon storage hackathon = hackathons[_hackathonId];
 
         require(
@@ -167,12 +241,70 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
         hackathon.participants[_winningParticipant].isWinner = true;
     }
 
+    event BatchPaymentExecuted(string indexed hackathonId);
+
+    // Function to execute batch payments
+    function executeBatchPayments(
+        string calldata hackathonId,
+        MetaDetail[] calldata metaDetails,
+        address[][] calldata pathsToUSD,
+        address feeAddress
+    ) external onlyOwner nonReentrant {
+        Hackathon storage hackathon = hackathons[hackathonId];
+
+        require(
+            hackathon.state == HackathonState.COMPLETED,
+            "Hackathon not completed"
+        );
+
+        for (uint256 i = 0; i < metaDetails.length; i++) {
+            require(
+                hackathon
+                    .participants[metaDetails[i].requestDetails[0].recipient]
+                    .isWinner,
+                "Address is not a winner"
+            );
+            require(
+                !hackathon
+                    .participants[metaDetails[i].requestDetails[0].recipient]
+                    .hasClaimedPrize,
+                "Prize already claimed"
+            );
+        }
+
+        // Validate total prize distribution matches the hackathon's contributions + base prize
+        uint256 calculatedTotal = 0;
+        for (uint256 i = 0; i < metaDetails.length; i++) {
+            calculatedTotal += metaDetails[i].requestDetails[0].requestAmount;
+        }
+        require(
+            calculatedTotal <= hackathon.basePrize + hackathon.contributions,
+            "Exceeds prize pool"
+        );
+
+        // Call the external BatchConversionPayments contract
+        try
+            IBatchConversionPayments(batchConversionPayments).batchPayments(
+                metaDetails,
+                pathsToUSD,
+                feeAddress
+            )
+        {
+            // Emit success event if needed
+            emit BatchPaymentExecuted(hackathonId);
+        } catch (bytes memory error) {
+            // Log the error for debugging
+            emit BatchPaymentExecutionFailed(hackathonId, string(error));
+            revert(string(error)); // Revert with the error message
+        }
+    }
+
     function claimPrize(
         string calldata _hackathonId,
         address winnerAddress,
-        bytes memory paymentRef,
-        address ethFeeProxy
-    ) external payable nonReentrant onlyOwner {
+        uint256 wonAmount,
+        bytes memory paymentRef
+    ) external payable nonReentrant {
         Hackathon storage hackathon = hackathons[_hackathonId];
 
         require(
@@ -183,7 +315,15 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
             hackathon.participants[winnerAddress].isWinner,
             "Address is not a winner"
         );
+        require(
+            !hackathon.participants[winnerAddress].hasClaimedPrize,
+            "Prize already claimed"
+        );
 
+        require(
+            wonAmount <= address(this).balance,
+            "Insufficient contract balance"
+        );
         bytes memory data = abi.encodeWithSignature(
             "transferWithReferenceAndFee(address,bytes,uint256,address)",
             payable(winnerAddress),
@@ -192,10 +332,31 @@ contract HackathonPrizePool is Ownable, ReentrancyGuard {
             payable(address(0))
         );
 
-        (bool callSuccess, ) = address(ethFeeProxy).call{value: msg.value}(
-            data
-        );
+        (bool callSuccess, bytes memory callData) = address(ethFeeProxy).call{
+            value: wonAmount
+        }(data);
+        require(callSuccess, string(callData));
+        // Mark as claimed
+        hackathon.participants[winnerAddress].hasClaimedPrize = true;
+    }
 
-        require(callSuccess, "Failed Call to EthFeeProxy Contract");
+    function getParticipantInfo(
+        string calldata _hackathonId,
+        address participantAddress
+    )
+        external
+        view
+        returns (bool isWinner, bool hasClaimedPrize, address walletAddress)
+    {
+        Hackathon storage hackathon = hackathons[_hackathonId];
+        Participant storage participant = hackathon.participants[
+            participantAddress
+        ];
+
+        return (
+            participant.isWinner,
+            participant.hasClaimedPrize,
+            participant.walletAddress
+        );
     }
 }

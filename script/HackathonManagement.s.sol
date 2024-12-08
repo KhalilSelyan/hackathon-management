@@ -2,18 +2,15 @@
 pragma solidity ^0.8.28;
 
 import {Script} from "forge-std/Script.sol";
-import {HackathonPrizePool} from "../src/HackathonManagement.sol";
+import {HackathonPrizeManagement} from "../src/HackathonManagement.sol";
 
-contract HackathonPrizePoolScript is Script {
-    HackathonPrizePool public hackathonPrizePool;
-
-    function setUp() public {}
-
-    function run() public {
+contract HackathonPrizeManagementScript is Script {
+    function run() external returns (HackathonPrizeManagement) {
         vm.startBroadcast();
 
-        HackathonPrizePool hackathonPrizePool = new HackathonPrizePool();
+        HackathonPrizeManagement hackathonPrizeManagement = new HackathonPrizeManagement();
 
         vm.stopBroadcast();
+        return hackathonPrizeManagement;
     }
 }
